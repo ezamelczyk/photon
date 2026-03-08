@@ -463,6 +463,17 @@ void main() {
             bent_normal = normal;
         }
 
+#ifdef LOD_MOD_ACTIVE
+        // LoD/far terrain can carry unstable normals/AO that appear as striping.
+        // Use stable flat lighting inputs there.
+        if (is_lod) {
+            normal = flat_normal;
+            bent_normal = flat_normal;
+            ao = 1.0;
+            ambient_sss = 0.0;
+        }
+#endif
+
         // Calculate lighting dot products
 
         float NoL = dot(normal, light_dir);
@@ -489,12 +500,33 @@ void main() {
 
         if (NoL > 1e-3 || material.sss_amount > 1e-3) {
             // Calculate near shadows
-            vec3 shadow_near = vec3(0.0);
+            vec3 shadow_near = vec3(1.0);
             float shadow_distant = 0.0;
             float sss_depth_near = 0.0;
             float sss_depth_distant = 0.0;
 
 #ifdef SHADOW
+#ifdef LOD_MOD_ACTIVE
+            // Shadow-map precision degrades quickly on LoD geometry.
+            bool force_distant_shadows = is_lod;
+
+            if (!force_distant_shadows) {
+                shadow_near = get_filtered_shadows(
+                    position_scene,
+                    flat_normal,
+                    light_levels.y,
+                    cloud_shadows,
+                    material.sss_amount,
+                    shadow_distance_fade,
+                    sss_depth_near
+                );
+            } else {
+                // LoD terrain is too coarse for stable low-res shadow maps.
+                // Force distant shadow solution only.
+                shadow_distance_fade = 1.0;
+                sss_depth_near = 0.0;
+            }
+#else
             shadow_near = get_filtered_shadows(
                 position_scene,
                 flat_normal,
@@ -505,6 +537,7 @@ void main() {
                 sss_depth_near
             );
 #endif
+#endif
 
             // Calculate distant shadows
             if (shadow_distance_fade >= eps) {
@@ -514,6 +547,7 @@ void main() {
                     position_view,
                     depth,
 #ifdef LOD_MOD_ACTIVE
+                    is_lod,
                     depth_lod,
 #endif
                     light_levels.y,

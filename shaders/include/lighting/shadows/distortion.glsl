@@ -38,9 +38,24 @@ vec3 get_shadow_bias(vec3 scene_pos, vec3 normal, float NoL, float skylight) {
     skylight = 1.0;
 #endif
 
-    // Shadow bias without peter-panning
-    return 0.25 * normal * clamp01(0.12 + 0.01 * length(scene_pos)) *
+    // Base bias from Complementary Reimagined method.
+    float base_bias = 0.25 * clamp01(0.12 + 0.01 * length(scene_pos)) *
         (2.0 - clamp01(NoL));
+
+    // At extreme shadow distances (hundreds/thousands of blocks), depth
+    // quantization causes striping on surfaces that should be fully lit.
+    // Increase bias smoothly only in that regime.
+    float dist = length(scene_pos);
+    float far_bias = linear_step(512.0, 8192.0, dist);
+    float bias_scale = mix(1.0, 2.8, far_bias);
+
+    // When shadowDistance is pushed to extreme values (e.g. 8192 blocks),
+    // depth precision collapses across the whole map. Increase global bias in
+    // that configuration to suppress near-field striping/acne.
+    float extreme_shadow_distance = linear_step(2048.0, 8192.0, shadowDistance);
+    bias_scale *= mix(1.0, 2.2, extreme_shadow_distance);
+
+    return base_bias * bias_scale * normal;
 }
 
 #endif // INCLUDE_LIGHTING_DISTORTION

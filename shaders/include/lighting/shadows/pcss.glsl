@@ -202,6 +202,8 @@ vec3 get_filtered_shadows(
     // permission
     vec3 edge_factor =
         0.1 - 0.2 * fract(scene_pos + cameraPosition + flat_normal * 0.01);
+    float extreme_shadow_distance = linear_step(2048.0, 8192.0, shadowDistance);
+    edge_factor *= 1.0 - 0.9 * extreme_shadow_distance;
     edge_factor -= edge_factor * skylight;
 
 #ifdef PIXELATED_SHADOWS
@@ -217,6 +219,12 @@ vec3 get_filtered_shadows(
         transform(shadowModelView, scene_pos + bias + edge_factor);
     vec3 shadow_clip_pos = project_ortho(shadowProjection, shadow_view_pos);
     vec3 shadow_screen_pos = distort_shadow_space(shadow_clip_pos) * 0.5 + 0.5;
+    float shadow_dist = length(scene_pos);
+
+    // Extra receiver bias for ultra-far shadows to suppress depth quantization
+    // striping on lit terrain.
+    float far_receiver_bias = linear_step(512.0, 8192.0, shadow_dist) * 0.02;
+    shadow_screen_pos.z -= far_receiver_bias;
 
     distance_fade = get_shadow_distance_fade(scene_pos, shadow_screen_pos);
 
@@ -225,29 +233,38 @@ vec3 get_filtered_shadows(
     }
 
     float dither = texelFetch(noisetex, ivec2(gl_FragCoord.xy) & 511, 0).b;
-    dither = r1(frameCounter, dither);
+    if (shadow_dist < 512.0) {
+        dither = r1(frameCounter, dither);
+    }
 
 #ifdef SHADOW_VPS
-    vec2 blocker_search_result =
-        blocker_search(scene_pos, dither, sss_amount > eps);
+    float penumbra_size;
+    if (shadow_dist < 1024.0) {
+        vec2 blocker_search_result =
+            blocker_search(scene_pos, dither, sss_amount > eps);
 
-    sss_depth = blocker_search_result.y;
+        sss_depth = blocker_search_result.y;
 
-    if (NoL < 1e-3) {
-        return vec3(0.0); // now we can exit early for SSS blocks
+        if (NoL < 1e-3) {
+            return vec3(0.0); // now we can exit early for SSS blocks
+        }
+        if (blocker_search_result.x < eps) {
+            return vec3(1.0); // blocker search empty handed => no occluders
+        }
+
+        penumbra_size = 16.0 * SHADOW_PENUMBRA_SCALE *
+            (shadow_screen_pos.z - blocker_search_result.x) /
+            blocker_search_result.x;
+        penumbra_size *=
+            5.0 - 4.0 * cloud_shadows; // Increase penumbra radius inside cloud
+                                       // shadows, nice overcast look
+        penumbra_size = min(penumbra_size, SHADOW_BLOCKER_SEARCH_RADIUS);
+        penumbra_size *= shadowProjection[0].x;
+    } else {
+        // VPS blocker search gets unstable at very far ranges.
+        penumbra_size = sqrt(0.5) * shadow_map_pixel_size * SHADOW_PENUMBRA_SCALE;
+        penumbra_size *= 1.0 + 7.0 * sss_amount;
     }
-    if (blocker_search_result.x < eps) {
-        return vec3(1.0); // blocker search empty handed => no occluders
-    }
-
-    float penumbra_size = 16.0 * SHADOW_PENUMBRA_SCALE *
-        (shadow_screen_pos.z - blocker_search_result.x) /
-        blocker_search_result.x;
-    penumbra_size *=
-        5.0 - 4.0 * cloud_shadows; // Increase penumbra radius inside cloud
-                                   // shadows, nice overcast look
-    penumbra_size = min(penumbra_size, SHADOW_BLOCKER_SEARCH_RADIUS);
-    penumbra_size *= shadowProjection[0].x;
 #else
     float penumbra_size =
         sqrt(0.5) * shadow_map_pixel_size * SHADOW_PENUMBRA_SCALE;
@@ -266,6 +283,7 @@ vec3 get_filtered_shadows(
         project_ortho(shadowProjection, shadow_view_pos_translucent);
     vec3 shadow_screen_pos_translucent =
         distort_shadow_space(shadow_clip_pos_translucent) * 0.5 + 0.5;
+    shadow_screen_pos_translucent.z -= far_receiver_bias;
 #endif
 
 #ifdef SHADOW_PCF

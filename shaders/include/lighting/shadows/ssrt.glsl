@@ -10,6 +10,7 @@ bool raymarch_shadow(
     sampler2D depth_sampler,
     mat4 projection_matrix,
     mat4 projection_matrix_inverse,
+    bool is_lod_depth,
     vec3 ray_origin_screen,
     vec3 ray_origin_view,
     vec3 ray_dir_view,
@@ -19,7 +20,6 @@ bool raymarch_shadow(
 ) {
     const uint step_count = uint(SHADOW_SSRT_STEPS);
     const float step_ratio = 2.0; // geometric sample distribution
-    const float z_tolerance = 10.0; // assumed thickness in blocks
 
     vec3 ray_dir_screen = normalize(
         view_to_screen_space(
@@ -65,12 +65,31 @@ bool raymarch_shadow(
             break;
         }
 
-        float depth = texelFetch(
-                          depth_sampler,
-                          ivec2(dithered_pos.xy * view_res * taau_render_scale),
-                          0
-        )
-                          .x;
+        ivec2 depth_size = textureSize(depth_sampler, 0);
+        ivec2 depth_texel = clamp(
+            ivec2(dithered_pos.xy * vec2(depth_size)),
+            ivec2(0),
+            depth_size - 1
+        );
+        float depth = texelFetch(depth_sampler, depth_texel, 0).x;
+
+#ifdef LOD_MOD_ACTIVE
+        if (is_lod_depth) {
+            // Conservative 2x2 depth fetch reduces jagged distant LoD edges.
+            ivec2 max_texel = textureSize(depth_sampler, 0) - 1;
+            ivec2 t00 = clamp(depth_texel, ivec2(0), max_texel);
+            ivec2 t10 = clamp(depth_texel + ivec2(1, 0), ivec2(0), max_texel);
+            ivec2 t01 = clamp(depth_texel + ivec2(0, 1), ivec2(0), max_texel);
+            ivec2 t11 = clamp(depth_texel + ivec2(1, 1), ivec2(0), max_texel);
+
+            float d00 = texelFetch(depth_sampler, t00, 0).x;
+            float d10 = texelFetch(depth_sampler, t10, 0).x;
+            float d01 = texelFetch(depth_sampler, t01, 0).x;
+            float d11 = texelFetch(depth_sampler, t11, 0).x;
+
+            depth = min(min(d00, d10), min(d01, d11));
+        }
+#endif
 
         float z_ray = screen_to_view_space_depth(
             projection_matrix_inverse,
@@ -78,9 +97,15 @@ bool raymarch_shadow(
         );
         float z_sample =
             screen_to_view_space_depth(projection_matrix_inverse, depth);
+        float z_delta = z_ray - z_sample;
+
+        // LoD terrain depth is coarse and tends to self-intersect in SSRT.
+        // Require a larger minimum thickness there to suppress shadow acne.
+        float z_min_thickness = is_lod_depth ? 0.8 : 0.05;
+        float z_max_thickness = is_lod_depth ? 24.0 : 10.0;
 
         bool inside = depth != 0.0 && depth < dithered_pos.z &&
-            abs(z_tolerance - (z_ray - z_sample)) < z_tolerance;
+            z_delta > z_min_thickness && z_delta < z_max_thickness;
         hit = inside || hit;
 
         if (sss_raymarch) {
@@ -110,6 +135,7 @@ float get_screen_space_shadows(
     vec3 position_view,
     float depth,
 #ifdef LOD_MOD_ACTIVE
+    bool is_lod_fragment,
     float depth_lod,
 #endif
     float skylight,
@@ -118,7 +144,6 @@ float get_screen_space_shadows(
 ) {
     // Dithering for ray offset
     float dither = texelFetch(noisetex, ivec2(gl_FragCoord.xy) & 511, 0).b;
-    dither = r1(frameCounter, dither);
 
     // Slightly randomise ray direction to create soft shadows
     vec2 hash = hash2(gl_FragCoord.xy);
@@ -126,12 +151,26 @@ float get_screen_space_shadows(
         normalize(view_light_dir + 0.03 * uniform_sphere_sample(hash));
 
 #ifdef LOD_MOD_ACTIVE
+    const float ssrt_reliable_distance = 640.0;
+    const float ssrt_disable_distance = 1024.0;
+    bool use_lod_ssrt = is_lod_fragment ||
+        length_squared(position_view) > sqr(ssrt_reliable_distance);
+
+    if (use_lod_ssrt) {
+        // Disable temporal jitter on coarse LoD depth to reduce shimmer.
+        dither = 0.0;
+    } else {
+        dither = r1(frameCounter, dither);
+    }
+
     // Which depth map to raymarch depends on distance
     // Closer fragments: use combined depth texture (so MC terrain can cast)
     // Further fragments: use LoD depth texture (maximise precision)
 
-    bool raymarch_combined_depth = length_squared(position_view) <
-        sqr(far + 64.0); // heuristic of 4 chunks overlap
+    bool raymarch_combined_depth =
+        !use_lod_ssrt &&
+        length_squared(position_view) <
+            sqr(far + 64.0); // heuristic of 4 chunks overlap
     bool hit;
 
     /*
@@ -148,6 +187,7 @@ float get_screen_space_shadows(
             combined_depth_tex,
             combined_projection_matrix,
             combined_projection_matrix_inverse,
+            false,
             vec3(position_screen_xy, depth),
             position_view,
             ray_dir,
@@ -156,23 +196,31 @@ float get_screen_space_shadows(
             sss_depth
         );
     } else {
+        vec3 lod_ray_origin_screen =
+            view_to_screen_space(lod_projection_matrix, position_view, true);
+        lod_ray_origin_screen.z = depth_lod;
+
         hit = raymarch_shadow(
-            lod_depth_tex,
+            lod_depth_tex_solid,
             lod_projection_matrix,
             lod_projection_matrix_inverse,
-            vec3(position_screen_xy, depth_lod),
+            true,
+            lod_ray_origin_screen,
             position_view,
-            ray_dir,
+            view_light_dir,
             has_sss,
             dither,
             sss_depth
         );
     }
 #else
+    dither = r1(frameCounter, dither);
+
     bool hit = raymarch_shadow(
         depthtex1,
         gbufferProjection,
         gbufferProjectionInverse,
+        false,
         vec3(position_screen_xy, depth),
         position_view,
         view_light_dir,
@@ -182,7 +230,21 @@ float get_screen_space_shadows(
     );
 #endif
 
-    return float(!hit) * get_lightmap_light_leak_prevention(skylight);
+    float ssrt_shadow = float(!hit) * get_lightmap_light_leak_prevention(skylight);
+
+#ifdef LOD_MOD_ACTIVE
+    if (use_lod_ssrt) {
+        // Keep distant shadows while damping LoD SSRT aliasing.
+        float lightmap_shadow = get_lightmap_shadows(skylight);
+        float dist = length(position_view);
+        float far_fade =
+            linear_step(ssrt_reliable_distance, ssrt_disable_distance, dist);
+        float ssrt_weight = mix(0.10, 0.0, far_fade);
+        return mix(lightmap_shadow, ssrt_shadow, ssrt_weight);
+    }
+#endif
+
+    return ssrt_shadow;
 }
 
 #endif // INCLUDE_LIGHTING_SHADOWS_SSRT_SHADOWS
